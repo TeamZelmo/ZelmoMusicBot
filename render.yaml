@@ -13,3 +13,15 @@ services:
         sync: false
       - key: SESSION_STRING
         sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: OWNER_USERNAME
+        sync: false
+      - key: SUPPORT_LINK
+        sync: false
+      - key: UPDATES_LINK
+        sync: false
+      - key: START_IMAGE
+        sync: false
+      - key: BOT_NAME
+        sync: false
