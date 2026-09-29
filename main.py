@@ -21,7 +21,7 @@ from pyrogram.types import (
 )
 from pytgcalls import PyTgCalls, idle, filters as fl
 from pytgcalls.types import MediaStream
-from ytmusicapi import YTMusic
+import requests
 import yt_dlp
 
 logging.basicConfig(level=logging.WARNING)
@@ -62,76 +62,172 @@ calls = PyTgCalls(assistant)
 
 queues: dict[int, list[dict]] = {}   # chat_id -> [{title, url}, ...]
 calls_ready = False
-_ytm = None
 
 
-# ---------------------------------------------------------------- SEARCH / EXTRACT
-def _cookie_file():
-    """YouTube cookies (optional):
-    1) Render Secret File: /etc/secrets/cookies.txt
-    2) ya cookies.txt file project folder me
-    3) ya Environment variable COOKIES (poora cookies.txt ka text)
-    """
-    dst = "/tmp/cookies.txt"
-    for src in ("/etc/secrets/cookies.txt", "cookies.txt"):
-        if os.path.exists(src):
-            shutil.copy(src, dst)        # yt-dlp file me likhta hai, isliye copy
-            return dst
-    if os.getenv("COOKIES"):
-        with open(dst, "w") as f:
-            f.write(os.getenv("COOKIES"))
-        return dst
+# ---------------------------------------------------------------- SEARCH / EXTRACT (bina cookies)
+# Order: 1) JioSaavn API  2) Audius API  3) SoundCloud (yt-dlp)
+QUALITY_ORDER = {"320kbps": 4, "160kbps": 3, "96kbps": 2, "48kbps": 1, "12kbps": 0}
+SAAVN_BASES = [
+    b.strip().rstrip("/")
+    for b in os.getenv("SAAVN_API", "https://saavn.dev/api,https://saavn.sumit.co/api").split(",")
+    if b.strip()
+]
+AUDIUS_APP = "".join(ch for ch in BOT_NAME if ch.isalnum()) or "MusicBot"
+
+
+def _saavn_search(query: str):
+    for base in SAAVN_BASES:
+        try:
+            r = requests.get(f"{base}/search/songs", params={"query": query, "limit": 1}, timeout=12)
+            r.raise_for_status()
+            results = (r.json().get("data") or {}).get("results") or []
+            if not results:
+                continue
+            song = results[0]
+            urls = sorted(
+                song.get("downloadUrl") or [],
+                key=lambda u: QUALITY_ORDER.get(u.get("quality"), -1),
+                reverse=True,
+            )
+            link = next((u.get("url") or u.get("link") for u in urls if (u.get("url") or u.get("link"))), None)
+            if not link:
+                continue
+            artists = song.get("artists")
+            primary = artists.get("primary", []) if isinstance(artists, dict) else []
+            names = ", ".join(a.get("name", "") for a in primary if a.get("name"))
+            name = html.unescape(song.get("name", "Unknown"))
+            return {"title": f"{name} - {names}" if names else name, "url": link}
+        except Exception as e:
+            print(f"Saavn ({base}) fail:", repr(e), flush=True)
     return None
 
 
-def _opts():
+def _audius_search(query: str):
+    headers = {}
+    if os.getenv("AUDIUS_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.getenv('AUDIUS_API_KEY')}"
+    try:
+        r = requests.get(
+            "https://api.audius.co/v1/tracks/search",
+            params={"query": query, "app_name": AUDIUS_APP},
+            headers=headers,
+            timeout=12,
+        )
+        r.raise_for_status()
+        for t in (r.json().get("data") or [])[:3]:
+            if t.get("is_streamable") is False:
+                continue
+            sr = requests.get(
+                f"https://api.audius.co/v1/tracks/{t['id']}/stream",
+                params={"app_name": AUDIUS_APP, "no_redirect": "true"},
+                headers=headers,
+                timeout=12,
+            )
+            if sr.status_code != 200:
+                continue
+            url = sr.json().get("data")
+            if url:
+                artist = (t.get("user") or {}).get("name", "")
+                title = f"{t.get('title', 'Unknown')} - {artist}" if artist else t.get("title", "Unknown")
+                return {"title": title, "url": url}
+    except Exception as e:
+        print("Audius fail:", repr(e), flush=True)
+    return None
+
+
+def _yt_opts():
     o = {"format": "bestaudio/best", "quiet": True, "noplaylist": True}
-    c = _cookie_file()
-    if c:
-        o["cookiefile"] = c
+    if os.getenv("YT_PROXY"):                    # residential proxy (optional)
+        o["proxy"] = os.getenv("YT_PROXY")
+    for src in ("/etc/secrets/cookies.txt", "cookies.txt"):   # cookies (optional)
+        if os.path.exists(src):
+            shutil.copy(src, "/tmp/cookies.txt")
+            o["cookiefile"] = "/tmp/cookies.txt"
+            break
     return o
 
 
-def _ytmusic_search(query: str):
-    """YouTube Music se original song dhoondho -> (url, title) ya None"""
-    global _ytm
+# YouTube ke alag-alag "clients": ek block ho to agla try hota hai
+YT_CLIENTS = [None, ["android_vr"], ["tv"], ["web_safari"], ["mweb"]]
+
+
+def _youtube(query: str) -> dict:
+    """1) YouTube par search -> top result  2) uska audio stream nikalo"""
+    # Step 1: YouTube search (sirf top result)
+    if query.startswith("http"):
+        video_url, title = query, None
+    else:
+        with yt_dlp.YoutubeDL({**_yt_opts(), "extract_flat": True}) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+        entry = info["entries"][0]
+        video_url = f"https://www.youtube.com/watch?v={entry['id']}"
+        title = entry.get("title")
+        print(f"YouTube top result: {title} ({entry['id']})", flush=True)
+
+    # Step 2: audio URL, alag-alag clients ke saath
+    last_err = None
+    for client in YT_CLIENTS:
+        opts = _yt_opts()
+        if client:
+            opts["extractor_args"] = {"youtube": {"player_client": client}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            print(f"YouTube OK (client={client or 'default'})", flush=True)
+            return {"title": title or info["title"], "url": info["url"]}
+        except Exception as e:
+            last_err = e
+            print(f"YouTube fail (client={client or 'default'}): {str(e)[:150]}", flush=True)
+    raise last_err
+
+
+def _youtube_safe(query: str):
     try:
-        if _ytm is None:
-            _ytm = YTMusic()
-        res = _ytm.search(query, filter="songs", limit=1)
-        if res:
-            r = res[0]
-            artists = ", ".join(a["name"] for a in r.get("artists", []) if a.get("name"))
-            title = f'{r["title"]} - {artists}' if artists else r["title"]
-            return f'https://www.youtube.com/watch?v={r["videoId"]}', title
+        return _youtube(query)
     except Exception as e:
-        print("ytmusicapi fail:", repr(e), flush=True)
-    return None
+        print("YouTube poori tarah fail:", str(e)[:200], flush=True)
+        return None
+
+
+def _soundcloud(query: str):
+    try:
+        with yt_dlp.YoutubeDL(_yt_opts()) as ydl:
+            info = ydl.extract_info(f"scsearch1:{query}", download=False)
+            if "entries" in info:
+                info = info["entries"][0]
+            return {"title": info["title"], "url": info["url"]}
+    except Exception as e:
+        print("SoundCloud fail:", str(e)[:150], flush=True)
+        return None
+
+
+# Default: sirf YouTube. Backup chahiye to Render me SOURCES=youtube,saavn,audius,soundcloud
+SOURCES = [x.strip() for x in os.getenv("SOURCES", "youtube").split(",") if x.strip()]
+FINDERS = {
+    "youtube": _youtube_safe,
+    "saavn": _saavn_search,
+    "audius": _audius_search,
+    "soundcloud": _soundcloud,
+}
 
 
 def _extract(query: str) -> dict:
-    """Order: YT Music search -> YouTube search -> SoundCloud search"""
-    tries = []   # (target, title_override)
+    # YouTube ka direct link
     if query.startswith("http"):
-        tries.append((query, None))
-    else:
-        found = _ytmusic_search(query)
-        if found:
-            tries.append(found)
-        tries.append((f"ytsearch1:{query}", None))
-        tries.append((f"scsearch1:{query}", None))
+        return _youtube(query)
 
-    last_err = None
-    for target, title in tries:
-        try:
-            with yt_dlp.YoutubeDL(_opts()) as ydl:
-                info = ydl.extract_info(target, download=False)
-                if "entries" in info:
-                    info = info["entries"][0]
-                return {"title": title or info["title"], "url": info["url"]}
-        except Exception as e:
-            last_err = e
-    raise last_err
+    for name in SOURCES:
+        finder = FINDERS.get(name)
+        if not finder:
+            continue
+        found = finder(query)
+        if found:
+            print(f"Source mila: {name}", flush=True)
+            return found
+    raise Exception(
+        "YouTube se gaana nahi nikal paya (server IP block ho sakta hai). "
+        "Render Logs dekho, ya bot ko PC par chalao / YT_PROXY lagao."
+    )
 
 
 async def start_track(chat_id: int) -> bool:
