@@ -3,3 +3,4 @@ tgcrypto
 py-tgcalls>=2.1.0,<3.0.0
 yt-dlp
 python-dotenv
+ytmusicapi
