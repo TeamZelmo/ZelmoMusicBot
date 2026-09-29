@@ -3,7 +3,8 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle as pyro_idle
+from pyrogram.handlers import RawUpdateHandler
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls, idle, filters as fl
 from pytgcalls.types import MediaStream
@@ -183,6 +184,10 @@ def start_health_server():
     ).start()
 
 
+async def _raw_log(client, update, users, chats):
+    print(f"[RAW] update aaya: {type(update).__name__}", flush=True)
+
+
 calls_ready = False
 
 
@@ -196,11 +201,17 @@ async def main():
         await asyncio.wait_for(bot.start(), timeout=90)
         me = await bot.get_me()
         print(f"STEP 2: BOT START OK -> @{me.username}", flush=True)
+        bot.add_handler(RawUpdateHandler(_raw_log), group=-2)
     except Exception as e:
         import traceback
         print("ERROR: BOT START FAIL (BOT_TOKEN / API_ID / API_HASH check karo):", repr(e), flush=True)
         traceback.print_exc()
         await asyncio.sleep(10**9)   # process zinda rakho taaki logs dikhein
+
+    if os.getenv("TEST_MODE") == "1":
+        print("TEST_MODE ON: helper/pytgcalls skip. Bot ko /ping bhejo.", flush=True)
+        await pyro_idle()
+        return
 
     # 2) Ab helper ID + voice chat part
     try:
