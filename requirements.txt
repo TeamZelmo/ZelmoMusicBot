@@ -1,5 +1,0 @@
-pyrofork
-tgcrypto
-py-tgcalls>=2.1.0
-yt-dlp
-python-dotenv
