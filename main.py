@@ -13,6 +13,10 @@ import yt_dlp
 import logging
 logging.basicConfig(level=logging.INFO)
 
+# IMPORTANT: Pyrogram Client isi loop ko yaad rakhta hai, isliye pehle loop banao
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -231,4 +235,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop.run_until_complete(main())
