@@ -9,6 +9,9 @@ from pytgcalls import PyTgCalls, idle, filters as fl
 from pytgcalls.types import MediaStream
 import yt_dlp
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -43,6 +46,23 @@ async def start_track(chat_id: int) -> bool:
     return True
 
 
+@bot.on_message(group=-1)
+async def _debug_log(_, m: Message):
+    print(f"[MSG] chat={m.chat.id} type={m.chat.type} text={m.text}", flush=True)
+
+
+@bot.on_message(filters.command("ping"))
+async def ping_cmd(_, m: Message):
+    await m.reply_text("🏓 Pong! Bot zinda hai.")
+
+
+@bot.on_message(
+    filters.command(["play", "skip", "pause", "resume", "stop", "queue"]) & filters.private
+)
+async def private_warn(_, m: Message):
+    await m.reply_text("⚠️ Ye command sirf group me chalta hai. Bot ko group me add karke use karo.")
+
+
 @bot.on_message(filters.command("start"))
 async def start_cmd(_, m: Message):
     await m.reply_text(
@@ -61,6 +81,8 @@ async def play_cmd(_, m: Message):
     if len(m.command) < 2:
         return await m.reply_text("Use: /play <song name ya YouTube link>")
     chat_id = m.chat.id
+    if not calls_ready:
+        return await m.reply_text("❌ Helper ID abhi start nahi hua. Render Logs me ERROR line dekho (SESSION_STRING check karo).")
     msg = await m.reply_text("🔎 Dhoond raha hu...")
     try:
         track = await asyncio.get_running_loop().run_in_executor(
@@ -161,13 +183,41 @@ def start_health_server():
     ).start()
 
 
+calls_ready = False
+
+
 async def main():
+    global calls_ready
     start_health_server()
-    await bot.start()
-    await assistant.start()
-    await calls.start()
-    print("Bot chalu ho gaya ✅")
+    print("STEP 1: health server chalu", flush=True)
+
+    # 1) Pehle sirf bot start karo, taaki commands turant kaam karein
+    try:
+        await asyncio.wait_for(bot.start(), timeout=90)
+        me = await bot.get_me()
+        print(f"STEP 2: BOT START OK -> @{me.username}", flush=True)
+    except Exception as e:
+        import traceback
+        print("ERROR: BOT START FAIL (BOT_TOKEN / API_ID / API_HASH check karo):", repr(e), flush=True)
+        traceback.print_exc()
+        await asyncio.sleep(10**9)   # process zinda rakho taaki logs dikhein
+
+    # 2) Ab helper ID + voice chat part
+    try:
+        await asyncio.wait_for(assistant.start(), timeout=90)
+        helper = await assistant.get_me()
+        print(f"STEP 3: HELPER START OK -> {helper.first_name} ({helper.id})", flush=True)
+        await asyncio.wait_for(calls.start(), timeout=90)
+        calls_ready = True
+        print("STEP 4: PYTGCALLS START OK -> Bot poori tarah ready ✅", flush=True)
+    except Exception as e:
+        import traceback
+        print("ERROR: HELPER / PYTGCALLS START FAIL (SESSION_STRING check karo):", repr(e), flush=True)
+        traceback.print_exc()
+        print("Bot commands chalenge, par gaana tab tak nahi bajega jab tak ye theek na ho.", flush=True)
+
     await idle()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
