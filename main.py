@@ -1,0 +1,152 @@
+import asyncio
+import os
+from dotenv import load_dotenv
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pytgcalls import PyTgCalls, idle, filters as fl
+from pytgcalls.types import MediaStream
+import yt_dlp
+
+load_dotenv()
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SESSION_STRING = os.getenv("SESSION_STRING")
+
+# Bot: commands sunta hai | Assistant: voice chat me gaana bajata hai
+bot = Client("musicbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+calls = PyTgCalls(assistant)
+
+queues: dict[int, list[dict]] = {}   # chat_id -> [{title, url}, ...]
+
+YDL_OPTS = {"format": "bestaudio/best", "quiet": True, "noplaylist": True}
+
+
+def _extract(query: str) -> dict:
+    if not query.startswith("http"):
+        query = f"ytsearch1:{query}"
+    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if "entries" in info:
+            info = info["entries"][0]
+        return {"title": info["title"], "url": info["url"]}
+
+
+async def start_track(chat_id: int) -> bool:
+    q = queues.get(chat_id)
+    if not q:
+        return False
+    await calls.play(chat_id, MediaStream(q[0]["url"]))
+    return True
+
+
+@bot.on_message(filters.command("start"))
+async def start_cmd(_, m: Message):
+    await m.reply_text(
+        "🎵 Music Bot\n\n"
+        "/play <naam ya link> - gaana bajao\n"
+        "/skip - agla gaana\n"
+        "/pause - roko\n"
+        "/resume - dobara chalao\n"
+        "/queue - queue dekho\n"
+        "/stop - band karo"
+    )
+
+
+@bot.on_message(filters.command("play") & filters.group)
+async def play_cmd(_, m: Message):
+    if len(m.command) < 2:
+        return await m.reply_text("Use: /play <song name ya YouTube link>")
+    chat_id = m.chat.id
+    msg = await m.reply_text("🔎 Dhoond raha hu...")
+    try:
+        track = await asyncio.get_running_loop().run_in_executor(
+            None, _extract, m.text.split(None, 1)[1]
+        )
+    except Exception as e:
+        return await msg.edit_text(f"❌ Gaana nahi mila: {e}")
+
+    queues.setdefault(chat_id, []).append(track)
+    if len(queues[chat_id]) == 1:
+        try:
+            await start_track(chat_id)
+            await msg.edit_text(f"▶️ Ab chal raha hai: {track['title']}")
+        except Exception as e:
+            queues[chat_id].clear()
+            await msg.edit_text(
+                f"❌ Play nahi hua: {e}\n\n"
+                "Check karo: group me voice chat ON hai, aur helper ID group me hai."
+            )
+    else:
+        await msg.edit_text(f"➕ Queue me add hua (#{len(queues[chat_id]) - 1}): {track['title']}")
+
+
+@bot.on_message(filters.command("skip") & filters.group)
+async def skip_cmd(_, m: Message):
+    q = queues.get(m.chat.id)
+    if not q:
+        return await m.reply_text("Kuch chal hi nahi raha.")
+    q.pop(0)
+    if q:
+        await start_track(m.chat.id)
+        await m.reply_text(f"⏭ Ab chal raha hai: {q[0]['title']}")
+    else:
+        await calls.leave_call(m.chat.id)
+        await m.reply_text("Queue khatam. Voice chat chhod diya.")
+
+
+@bot.on_message(filters.command("pause") & filters.group)
+async def pause_cmd(_, m: Message):
+    await calls.pause(m.chat.id)
+    await m.reply_text("⏸ Paused")
+
+
+@bot.on_message(filters.command("resume") & filters.group)
+async def resume_cmd(_, m: Message):
+    await calls.resume(m.chat.id)
+    await m.reply_text("▶️ Resumed")
+
+
+@bot.on_message(filters.command("stop") & filters.group)
+async def stop_cmd(_, m: Message):
+    queues.pop(m.chat.id, None)
+    try:
+        await calls.leave_call(m.chat.id)
+    except Exception:
+        pass
+    await m.reply_text("⏹ Band kar diya.")
+
+
+@bot.on_message(filters.command("queue") & filters.group)
+async def queue_cmd(_, m: Message):
+    q = queues.get(m.chat.id)
+    if not q:
+        return await m.reply_text("Queue khali hai.")
+    text = f"▶️ {q[0]['title']}\n" + "\n".join(f"{i}. {t['title']}" for i, t in enumerate(q[1:], 1))
+    await m.reply_text(text)
+
+
+# Gaana khatam hone par apne aap agla gaana
+@calls.on_update(fl.stream_end)
+async def on_end(_, update):
+    chat_id = update.chat_id
+    q = queues.get(chat_id)
+    if q:
+        q.pop(0)
+    if q:
+        await start_track(chat_id)
+    else:
+        queues.pop(chat_id, None)
+        await calls.leave_call(chat_id)
+
+
+async def main():
+    await bot.start()
+    await assistant.start()
+    await calls.start()
+    print("Bot chalu ho gaya ✅")
+    await idle()
+
+if __name__ == "__main__":
+    asyncio.run(main())
