@@ -9,7 +9,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ASSISTANT_SESSION = os.getenv("ASSISTANT_SESSION", "").strip()
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
 
-TUNELIO_API_KEY = os.getenv("TUNELIO_API_KEY", "").strip()
+# YouTube cookies
+COOKIES_PATH = os.getenv(
+    "COOKIES_PATH",
+    "/app/cookies.txt"
+).strip()
 
 if not API_ID:
     raise RuntimeError("API_ID is missing.")
@@ -25,6 +29,3 @@ if not ASSISTANT_SESSION:
 
 if not GROUP_ID:
     raise RuntimeError("GROUP_ID is missing.")
-
-if not TUNELIO_API_KEY:
-    raise RuntimeError("TUNELIO_API_KEY is missing.")
