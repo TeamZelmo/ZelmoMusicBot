@@ -2,5 +2,5 @@ pyrogrammod>=2.1.2
 tgcrypto
 py-tgcalls==3.0.0
 ytmusicapi
+yt-dlp
 python-dotenv
-aiohttp
