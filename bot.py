@@ -8,7 +8,840 @@ from dotenv import load_dotenv
 
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarimport os
+import re
+import json
+import asyncio
+import logging
+import sqlite3
+import tempfile
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
+
+import yt_dlp
+from dotenv import load_dotenv
+from pyrogram import Client, filters
+from pyrogram.errors import MessageIdInvalid
+from pyrogram.handlers import MessageHandler
+from pyrogram.types import Message
+from pytgcalls import PyTgCalls, filters as tg_filters
+from pytgcalls.types import MediaStream
+from pytgcalls.types import StreamEnded
+
+load_dotenv()
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ASSISTANT_SESSION = os.getenv("ASSISTANT_SESSION", "").strip()
+
+GROUP_ID = int(os.getenv("GROUP_ID", "0"))
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0"))
+COOKIES_PATH = os.getenv("COOKIES_PATH", "/app/cookies.txt")
+
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise RuntimeError("API_ID, API_HASH and BOT_TOKEN are required.")
+
+if not ASSISTANT_SESSION:
+    raise RuntimeError("ASSISTANT_SESSION is required.")
+
+if not GROUP_ID or not STORAGE_CHANNEL_ID:
+    raise RuntimeError("GROUP_ID and STORAGE_CHANNEL_ID are required.")
+
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("MusicBot")
+
+# --------------------------------------------------
+# CLIENTS
+# --------------------------------------------------
+
+bot = Client(
+    "music_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
+
+assistant = Client(
+    "music_assistant",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=ASSISTANT_SESSION,
+)
+
+voice = PyTgCalls(assistant)
+
+# --------------------------------------------------
+# DATABASE
+# --------------------------------------------------
+
+DB_PATH = os.getenv("DATABASE_PATH", "/app/music_cache.db")
+
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS song_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_key TEXT NOT NULL,
+    title_key TEXT NOT NULL,
+    youtube_id TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    channel_message_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    duration INTEGER DEFAULT 0,
+    UNIQUE(youtube_id, media_type)
+)
+""")
+
+db.execute("""
+CREATE INDEX IF NOT EXISTS idx_cache_query
+ON song_cache(query_key, media_type)
+""")
+
+db.commit()
+
+db_lock = asyncio.Lock()
+
+# --------------------------------------------------
+# PLAYBACK STATE
+# --------------------------------------------------
+
+@dataclass
+class Song:
+    title: str
+    youtube_url: str
+    youtube_id: str
+    duration: int
+    media_type: str
+    query_key: str
+    file_path: Optional[str] = None
+    channel_message_id: Optional[int] = None
+
+
+queues = {}
+current_song = {}
+paused_chats = set()
+play_locks = {}
+download_locks = {}
+current_message = {}
+
+DOWNLOAD_DIR = Path("/app/downloads")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def normalize(text: str) -> str:
+    text = text.casefold().strip()
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def get_lock(chat_id: int) -> asyncio.Lock:
+    if chat_id not in play_locks:
+        play_locks[chat_id] = asyncio.Lock()
+    return play_locks[chat_id]
+
+
+def get_download_lock(key: str) -> asyncio.Lock:
+    if key not in download_locks:
+        download_locks[key] = asyncio.Lock()
+    return download_locks[key]
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02}:{secs:02}"
+
+    return f"{minutes}:{secs:02}"
+
+
+# --------------------------------------------------
+# YOUTUBE SEARCH
+# --------------------------------------------------
+
+def ytdlp_options() -> dict:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default", "web_embedded"]
+            }
+        },
+    }
+
+    if os.path.isfile(COOKIES_PATH):
+        options["cookiefile"] = COOKIES_PATH
+
+    return options
+
+
+async def search_youtube(query: str) -> Song:
+    logger.info("YouTube search: %s", query)
+
+    options = ytdlp_options()
+    options.update({
+        "extract_flat": True,
+        "skip_download": True,
+    })
+
+    def search():
+        with yt_dlp.YoutubeDL(options) as ydl:
+            result = ydl.extract_info(
+                f"ytsearch1:{query}",
+                download=False,
+            )
+
+            entries = result.get("entries") or []
+            if not entries:
+                raise RuntimeError("No YouTube results found.")
+
+            item = entries[0]
+            video_id = item.get("id")
+
+            if not video_id:
+                raise RuntimeError("YouTube did not return a video ID.")
+
+            return {
+                "id": video_id,
+                "title": item.get("title") or query,
+                "duration": int(item.get("duration") or 0),
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+            }
+
+    result = await asyncio.to_thread(search)
+
+    return Song(
+        title=result["title"],
+        youtube_url=result["url"],
+        youtube_id=result["id"],
+        duration=result["duration"],
+        media_type="",
+        query_key=normalize(query),
+    )
+
+
+# --------------------------------------------------
+# CHANNEL CACHE LOOKUP
+# --------------------------------------------------
+
+async def find_cached_song(
+    query: str,
+    media_type: str,
+) -> Optional[dict]:
+    """
+    Search the local index of media already saved in the
+    Telegram storage channel. No YouTube search is run here.
+    """
+    key = normalize(query)
+
+    async with db_lock:
+        row = db.execute("""
+            SELECT *
+            FROM song_cache
+            WHERE media_type = ?
+              AND (query_key = ? OR title_key = ?)
+            ORDER BY id DESC
+            LIMIT 1
+        """, (media_type, key, key)).fetchone()
+
+    if not row:
+        return None
+
+    # Verify that the indexed message still exists in the channel.
+    try:
+        message = await bot.get_messages(
+            STORAGE_CHANNEL_ID,
+            int(row["channel_message_id"]),
+        )
+
+        if not message or message.empty or not (
+            message.audio or message.video or message.document
+        ):
+            logger.warning("Cache entry points to missing media.")
+            return None
+
+    except Exception:
+        logger.exception("Could not verify cached channel message.")
+        return None
+
+    return dict(row)
+
+
+async def save_cache(
+    song: Song,
+    media_type: str,
+    message_id: int,
+    original_query: str,
+):
+    async with db_lock:
+        db.execute("""
+            INSERT INTO song_cache (
+                query_key,
+                title_key,
+                youtube_id,
+                media_type,
+                channel_message_id,
+                title,
+                duration
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(youtube_id, media_type)
+            DO UPDATE SET
+                query_key = excluded.query_key,
+                title_key = excluded.title_key,
+                channel_message_id = excluded.channel_message_id,
+                title = excluded.title,
+                duration = excluded.duration
+        """, (
+            normalize(original_query),
+            normalize(song.title),
+            song.youtube_id,
+            media_type,
+            message_id,
+            song.title,
+            song.duration,
+        ))
+        db.commit()
+
+
+# --------------------------------------------------
+# DOWNLOAD MEDIA
+# --------------------------------------------------
+
+async def download_song(song: Song, media_type: str) -> str:
+    """
+    Download one audio or video file into a temporary folder.
+    Returns the actual file path produced by yt-dlp.
+    """
+    temp_dir = tempfile.mkdtemp(
+        prefix=f"{media_type}_",
+        dir=str(DOWNLOAD_DIR),
+    )
+
+    output_template = str(Path(temp_dir) / "%(id)s.%(ext)s")
+
+    options = ytdlp_options()
+    options.update({
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "overwrites": False,
+        "continuedl": True,
+    })
+
+    if media_type == "audio":
+        options.update({
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+        })
+    else:
+        options.update({
+            "format": "best[ext=mp4][vcodec!=none][acodec!=none]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+            "merge_output_format": "mp4",
+        })
+
+    logger.info("Downloading %s: %s", media_type, song.title)
+
+    def download():
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                song.youtube_url,
+                download=True,
+            )
+            filepath = ydl.prepare_filename(info)
+
+            # Video may be merged to MP4 after downloading.
+            if media_type == "video":
+                merged = str(Path(filepath).with_suffix(".mp4"))
+                if os.path.isfile(merged):
+                    return merged
+
+            if os.path.isfile(filepath):
+                return filepath
+
+            # Find the real output if yt-dlp changed the extension.
+            candidates = list(Path(temp_dir).glob(f"{song.youtube_id}.*"))
+            if candidates:
+                return str(candidates[0])
+
+            raise RuntimeError("Downloaded media file was not found.")
+
+    try:
+        path = await asyncio.to_thread(download)
+
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            raise RuntimeError("Downloaded file is missing or empty.")
+
+        song.file_path = path
+        logger.info("Download complete: %s", path)
+        return path
+
+    except Exception:
+        logger.exception("Download failed.")
+        raise
+
+
+# --------------------------------------------------
+# UPLOAD TO STORAGE CHANNEL
+# --------------------------------------------------
+
+async def upload_to_channel(
+    song: Song,
+    file_path: str,
+    media_type: str,
+) -> int:
+    caption = (
+        f"🎵 {song.title}\n"
+        f"ID: {song.youtube_id}\n"
+        f"Type: {media_type}"
+    )
+
+    if media_type == "audio":
+        message = await bot.send_audio(
+            STORAGE_CHANNEL_ID,
+            audio=file_path,
+            title=song.title[:64],
+            duration=song.duration,
+            caption=caption,
+        )
+    else:
+        message = await bot.send_video(
+            STORAGE_CHANNEL_ID,
+            video=file_path,
+            caption=caption,
+            duration=song.duration,
+            supports_streaming=True,
+        )
+
+    logger.info(
+        "Saved in storage channel: message_id=%s",
+        message.id,
+    )
+
+    return message.id
+
+
+# --------------------------------------------------
+# GET MEDIA: CACHE FIRST, YOUTUBE ONLY IF NEEDED
+# --------------------------------------------------
+
+async def get_song(
+    query: str,
+    media_type: str,
+) -> Song:
+    """
+    1. Check channel cache index.
+    2. If found, download that Telegram message locally.
+    3. Otherwise search YouTube, download, upload to channel,
+       and index the new message.
+    """
+    key = normalize(query)
+    lock = get_download_lock(f"{media_type}:{key}")
+
+    async with lock:
+        cached = await find_cached_song(query, media_type)
+
+        if cached:
+            logger.info(
+                "CACHE HIT: %s (%s); skipping YouTube search.",
+                cached["title"],
+                media_type,
+            )
+
+            message = await bot.get_messages(
+                STORAGE_CHANNEL_ID,
+                int(cached["channel_message_id"]),
+            )
+
+            local_path = await bot.download_media(
+                message,
+                file_name=str(DOWNLOAD_DIR) + "/",
+            )
+
+            if not local_path or not os.path.isfile(local_path):
+                raise RuntimeError(
+                    "Could not download cached media from the channel."
+                )
+
+            return Song(
+                title=cached["title"],
+                youtube_url=(
+                    f"https://www.youtube.com/watch?v={cached['youtube_id']}"
+                ),
+                youtube_id=cached["youtube_id"],
+                duration=int(cached["duration"] or 0),
+                media_type=media_type,
+                query_key=key,
+                file_path=local_path,
+                channel_message_id=int(cached["channel_message_id"]),
+            )
+
+        logger.info(
+            "CACHE MISS: %s (%s); searching YouTube now.",
+            query,
+            media_type,
+        )
+
+        song = await search_youtube(query)
+        song.media_type = media_type
+
+        file_path = await download_song(song, media_type)
+
+        # Save the downloaded file in the channel before playback.
+        message_id = await upload_to_channel(
+            song,
+            file_path,
+            media_type,
+        )
+
+        song.channel_message_id = message_id
+
+        await save_cache(
+            song,
+            media_type,
+            message_id,
+            query,
+        )
+
+        return song
+
+
+# --------------------------------------------------
+# PLAYBACK
+# --------------------------------------------------
+
+async def play_song(chat_id: int, song: Song):
+    if not song.file_path:
+        raise RuntimeError("Song file path is missing.")
+
+    lock = get_lock(chat_id)
+
+    async with lock:
+        current_song[chat_id] = song
+        paused_chats.discard(chat_id)
+
+        logger.info(
+            "Starting %s playback: %s",
+            song.media_type,
+            song.title,
+        )
+
+        if song.media_type == "audio":
+            stream = MediaStream(
+                song.file_path,
+                video_flags=MediaStream.Flags.IGNORE,
+            )
+        else:
+            stream = MediaStream(song.file_path)
+
+        await voice.play(chat_id, stream)
+
+        await send_now_playing(chat_id, song)
+
+
+async def send_now_playing(chat_id: int, song: Song):
+    old_id = current_message.get(chat_id)
+
+    if old_id:
+        try:
+            await bot.delete_messages(chat_id, old_id)
+        except Exception:
+            pass
+
+    mode = "🎧 Audio" if song.media_type == "audio" else "📺 Video"
+
+    message = await bot.send_message(
+        chat_id,
+        (
+            f"🎶 **Now Playing**\n\n"
+            f"**{song.title}**\n"
+            f"⏱ `{format_duration(song.duration)}`\n"
+            f"{mode}\n\n"
+            f"Use `/queue`, `/skip`, `/pause`, `/resume`, or `/stop`."
+        ),
+    )
+
+    current_message[chat_id] = message.id
+
+
+async def play_next(chat_id: int):
+    queue = queues.get(chat_id, [])
+
+    if not queue:
+        current_song.pop(chat_id, None)
+        return
+
+    song = queue.pop(0)
+
+    try:
+        await play_song(chat_id, song)
+    except Exception as exc:
+        logger.exception("Could not play queued song.")
+        await bot.send_message(
+            chat_id,
+            f"❌ Could not play **{song.title}**: `{str(exc)[:500]}`",
+        )
+        await play_next(chat_id)
+
+
+# --------------------------------------------------
+# COMMANDS
+# --------------------------------------------------
+
+async def start_command(_: Client, message: Message):
+    await message.reply_text(
+        "🎵 **Music Bot Ready**\n\n"
+        "`/play song name` — Audio playback\n"
+        "`/vplay song name` — Video playback\n"
+        "`/queue` — Show queue\n"
+        "`/now` — Current song\n"
+        "`/skip` — Skip\n"
+        "`/pause` — Pause\n"
+        "`/resume` — Resume\n"
+        "`/stop` — Stop playback"
+    )
+
+
+async def play_command(_: Client, message: Message):
+    await handle_play(message, "audio")
+
+
+async def vplay_command(_: Client, message: Message):
+    await handle_play(message, "video")
+
+
+async def handle_play(message: Message, media_type: str):
+    query = " ".join(message.command[1:]).strip()
+
+    if not query:
+        command = "/play" if media_type == "audio" else "/vplay"
+        await message.reply_text(
+            f"Usage: `{command} song name`"
+        )
+        return
+
+    status = await message.reply_text(
+        "🔎 Checking storage channel first..."
+    )
+
+    try:
+        song = await get_song(query, media_type)
+
+        chat_id = message.chat.id
+
+        if chat_id in current_song:
+            queues.setdefault(chat_id, []).append(song)
+            await status.edit_text(
+                f"➕ Added to queue: **{song.title}**"
+            )
+            return
+
+        await status.edit_text(
+            f"▶️ Starting: **{song.title}**"
+        )
+
+        await play_song(chat_id, song)
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+    except Exception as exc:
+        logger.exception("Play request failed.")
+        await status.edit_text(
+            f"❌ **Playback failed**\n\n`{str(exc)[:700]}`"
+        )
+
+
+async def queue_command(_: Client, message: Message):
+    chat_id = message.chat.id
+    items = queues.get(chat_id, [])
+
+    if not items:
+        await message.reply_text("📭 Queue is empty.")
+        return
+
+    lines = ["📜 **Upcoming Queue**"]
+    for index, song in enumerate(items[:20], start=1):
+        lines.append(
+            f"{index}. {song.title} "
+            f"({song.media_type}, {format_duration(song.duration)})"
+        )
+
+    await message.reply_text("\n".join(lines))
+
+
+async def now_command(_: Client, message: Message):
+    song = current_song.get(message.chat.id)
+
+    if not song:
+        await message.reply_text("Nothing is playing right now.")
+        return
+
+    await message.reply_text(
+        f"🎶 **Now Playing**\n\n"
+        f"**{song.title}**\n"
+        f"⏱ `{format_duration(song.duration)}`\n"
+        f"Mode: `{song.media_type}`"
+    )
+
+
+async def skip_command(_: Client, message: Message):
+    chat_id = message.chat.id
+
+    try:
+        await voice.leave_call(chat_id)
+    except Exception:
+        pass
+
+    current_song.pop(chat_id, None)
+    paused_chats.discard(chat_id)
+
+    await message.reply_text("⏭ Skipped.")
+
+    await play_next(chat_id)
+
+
+async def pause_command(_: Client, message: Message):
+    chat_id = message.chat.id
+
+    if chat_id not in current_song:
+        await message.reply_text("Nothing is playing.")
+        return
+
+    try:
+        await voice.pause_stream(chat_id)
+        paused_chats.add(chat_id)
+        await message.reply_text("⏸ Paused.")
+    except Exception as exc:
+        await message.reply_text(f"❌ Pause failed: `{str(exc)[:300]}`")
+
+
+async def resume_command(_: Client, message: Message):
+    chat_id = message.chat.id
+
+    if chat_id not in current_song:
+        await message.reply_text("Nothing is playing.")
+        return
+
+    try:
+        await voice.resume_stream(chat_id)
+        paused_chats.discard(chat_id)
+        await message.reply_text("▶️ Resumed.")
+    except Exception as exc:
+        await message.reply_text(f"❌ Resume failed: `{str(exc)[:300]}`")
+
+
+async def stop_command(_: Client, message: Message):
+    chat_id = message.chat.id
+
+    queues.pop(chat_id, None)
+    current_song.pop(chat_id, None)
+    paused_chats.discard(chat_id)
+
+    try:
+        await voice.leave_call(chat_id)
+    except Exception:
+        pass
+
+    await message.reply_text("⏹ Playback stopped and queue cleared.")
+
+
+# --------------------------------------------------
+# STREAM END EVENT
+# --------------------------------------------------
+
+async def stream_ended_handler(
+    _: PyTgCalls,
+    update: StreamEnded,
+):
+    chat_id = update.chat_id
+
+    current_song.pop(chat_id, None)
+    paused_chats.discard(chat_id)
+
+    await asyncio.sleep(0.5)
+
+    if queues.get(chat_id):
+        await play_next(chat_id)
+
+
+# --------------------------------------------------
+# STARTUP
+# --------------------------------------------------
+
+def register_handlers():
+    bot.add_handler(MessageHandler(start_command, filters.command("start")))
+    bot.add_handler(MessageHandler(play_command, filters.command("play")))
+    bot.add_handler(MessageHandler(vplay_command, filters.command("vplay")))
+    bot.add_handler(MessageHandler(queue_command, filters.command("queue")))
+    bot.add_handler(MessageHandler(now_command, filters.command("now")))
+    bot.add_handler(MessageHandler(skip_command, filters.command("skip")))
+    bot.add_handler(MessageHandler(pause_command, filters.command("pause")))
+    bot.add_handler(MessageHandler(resume_command, filters.command("resume")))
+    bot.add_handler(MessageHandler(stop_command, filters.command("stop")))
+
+
+async def main():
+    register_handlers()
+
+    await bot.start()
+    logger.info("Bot started.")
+
+    await assistant.start()
+    logger.info("Assistant started.")
+
+    await voice.start()
+    logger.info("PyTgCalls started.")
+
+    voice.on_update(
+        tg_filters.stream_end()
+    )(stream_ended_handler)
+
+    try:
+        await bot.send_message(
+            GROUP_ID,
+            "✅ **Music Bot is ready!**\nUse `/play` or `/vplay`.",
+        )
+    except Exception:
+        logger.exception("Could not send startup message.")
+
+    logger.info("MUSIC BOT IS READY")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        try:
+            await voice.stop()
+        except Exception:
+            pass
+
+        await assistant.stop()
+        await bot.stop()
+        db.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())kup, InlineKeyboardButton
 
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as tg_filters
