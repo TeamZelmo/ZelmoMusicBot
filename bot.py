@@ -8,7 +8,9 @@ from pyrogram.types import Message
 
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as tg_filters
-from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
+from pytgcalls.types import MediaStream
+from pytgcalls.types import AudioQuality
+from pytgcalls.types.stream import StreamEnded
 
 from ytmusicapi import YTMusic
 
@@ -34,7 +36,7 @@ logger = logging.getLogger("MusicBot")
 
 
 # ============================================================
-# BOT CLIENT
+# CLIENTS
 # ============================================================
 
 bot = Client(
@@ -45,10 +47,6 @@ bot = Client(
 )
 
 
-# ============================================================
-# ASSISTANT / USERBOT CLIENT
-# ============================================================
-
 assistant = Client(
     "music_assistant",
     api_id=API_ID,
@@ -57,22 +55,13 @@ assistant = Client(
 )
 
 
-# ============================================================
-# PYTGCalls
-# ============================================================
-
 voice = PyTgCalls(assistant)
-
-
-# ============================================================
-# YOUTUBE MUSIC
-# ============================================================
 
 ytmusic = YTMusic()
 
 
 # ============================================================
-# SONG MODEL
+# DATA
 # ============================================================
 
 @dataclass
@@ -87,10 +76,6 @@ class Song:
         return f"https://www.youtube.com/watch?v={self.video_id}"
 
 
-# ============================================================
-# MUSIC STATE
-# ============================================================
-
 queues: Dict[int, List[Song]] = {}
 
 current_song: Dict[int, Song] = {}
@@ -99,32 +84,24 @@ play_locks: Dict[int, asyncio.Lock] = {}
 
 
 # ============================================================
-# LOCK
+# HELPERS
 # ============================================================
 
 def get_lock(chat_id: int) -> asyncio.Lock:
-
     if chat_id not in play_locks:
         play_locks[chat_id] = asyncio.Lock()
 
     return play_locks[chat_id]
 
 
-# ============================================================
-# SAFE MESSAGE EDIT
-# ============================================================
-
 async def safe_edit(message: Message, text: str):
-
     try:
-
         if message.text == text:
             return message
 
         return await message.edit_text(text)
 
     except Exception as error:
-
         if "MESSAGE_NOT_MODIFIED" in str(error):
             return message
 
@@ -135,10 +112,8 @@ async def safe_edit(message: Message, text: str):
 # YOUTUBE MUSIC SEARCH
 # ============================================================
 
-async def search_song(query: str):
-
+async def search_song(query: str) -> List[Song]:
     try:
-
         results = await asyncio.to_thread(
             ytmusic.search,
             query,
@@ -146,78 +121,70 @@ async def search_song(query: str):
             limit=5,
         )
 
-        songs = []
-
-        for item in results:
-
-            video_id = item.get("videoId")
-
-            if not video_id:
-                continue
-
-            title = item.get(
-                "title",
-                "Unknown",
-            )
-
-            artists = item.get(
-                "artists",
-                [],
-            )
-
-            if artists:
-
-                artist = ", ".join(
-                    artist_data.get(
-                        "name",
-                        "Unknown",
-                    )
-                    for artist_data in artists
-                )
-
-            else:
-
-                artist = "Unknown"
-
-            duration = item.get(
-                "duration",
-                "Unknown",
-            )
-
-            songs.append(
-                Song(
-                    title=title,
-                    artist=artist,
-                    video_id=video_id,
-                    duration=duration,
-                )
-            )
-
-        return songs
-
     except Exception as error:
+        logger.exception("YouTube Music search failed: %s", error)
+        return []
 
-        logger.exception(
-            "YouTube Music search failed: %s",
-            error,
+    songs = []
+
+    for item in results:
+        video_id = item.get("videoId")
+
+        if not video_id:
+            continue
+
+        title = item.get("title", "Unknown")
+
+        artists = item.get("artists") or []
+
+        if artists:
+            artist = ", ".join(
+                artist_item.get("name", "")
+                for artist_item in artists
+                if artist_item.get("name")
+            )
+        else:
+            artist = "Unknown Artist"
+
+        duration = item.get("duration", "Unknown")
+
+        songs.append(
+            Song(
+                title=title,
+                artist=artist,
+                video_id=video_id,
+                duration=duration,
+            )
         )
 
-        return []
+    return songs
 
 
 # ============================================================
-# CREATE STREAM
+# YT-DLP STREAM
 # ============================================================
 
 def create_stream(song: Song) -> MediaStream:
+    """
+    Cookies-free YouTube extraction.
+
+    We deliberately avoid --cookies.
+
+    The selected clients are intended to reduce dependency
+    on PO tokens for GVS requests.
+    """
+
+    ytdlp_parameters = (
+        "--no-playlist "
+        "--extract-audio "
+        "--extractor-args "
+        "\"youtube:player_client=android_vr,web_embedded\" "
+    )
 
     return MediaStream(
         song.youtube_url,
         AudioQuality.HIGH,
-        ytdlp_parameters=(
-            "--no-playlist "
-            "--extract-audio"
-        ),
+        ytdlp_parameters=ytdlp_parameters,
     )
 
 
@@ -225,12 +192,10 @@ def create_stream(song: Song) -> MediaStream:
 # PLAY SONG
 # ============================================================
 
-async def play_song(
-    chat_id: int,
-    song: Song,
-):
+async def play_song(chat_id: int, song: Song):
+    lock = get_lock(chat_id)
 
-    async with get_lock(chat_id):
+    async with lock:
 
         logger.info(
             "Starting stream in %s: %s - %s",
@@ -240,7 +205,6 @@ async def play_song(
         )
 
         try:
-
             stream = create_stream(song)
 
             await voice.play(
@@ -251,10 +215,9 @@ async def play_song(
             current_song[chat_id] = song
 
             logger.info(
-                "Now playing in %s: %s - %s",
+                "Playback started in %s: %s",
                 chat_id,
                 song.title,
-                song.artist,
             )
 
         except Exception as error:
@@ -265,42 +228,46 @@ async def play_song(
                 error,
             )
 
-            current_song.pop(
-                chat_id,
-                None,
-            )
+            current_song.pop(chat_id, None)
+
+            raise
 
 
 # ============================================================
-# PLAY NEXT SONG
+# PLAY NEXT
 # ============================================================
 
 async def play_next(chat_id: int):
 
-    if not queues.get(chat_id):
+    queue = queues.get(chat_id)
 
-        current_song.pop(
-            chat_id,
-            None,
-        )
-
-        logger.info(
-            "Queue empty for chat %s",
-            chat_id,
-        )
-
+    if not queue:
+        current_song.pop(chat_id, None)
         return
 
-    song = queues[chat_id].pop(0)
+    song = queue.pop(0)
 
-    await play_song(
-        chat_id,
-        song,
-    )
+    try:
+        await play_song(
+            chat_id,
+            song,
+        )
+
+    except Exception as error:
+
+        logger.error(
+            "Could not play next song in %s: %s",
+            chat_id,
+            error,
+        )
+
+        if queues.get(chat_id):
+            await asyncio.sleep(2)
+            await play_next(chat_id)
 
 
 # ============================================================
-# STARTUP LOG MESSAGES
+# STARTUP MESSAGES
 # ============================================================
 
 async def send_startup_messages(
@@ -310,13 +277,7 @@ async def send_startup_messages(
 
     try:
 
-        # ----------------------------------------------------
-        # Resolve log group
-        # ----------------------------------------------------
-
-        chat = await bot.get_chat(
-            GROUP_ID
-        )
+        chat = await bot.get_chat(GROUP_ID)
 
         chat_id = chat.id
 
@@ -339,10 +300,6 @@ async def send_startup_messages(
             bot_text,
         )
 
-        logger.info(
-            "Bot startup message sent."
-        )
-
         # ----------------------------------------------------
         # ASSISTANT MESSAGE
         # ----------------------------------------------------
@@ -363,10 +320,6 @@ async def send_startup_messages(
             assistant_text,
         )
 
-        logger.info(
-            "Assistant startup message sent."
-        )
-
     except Exception as error:
 
         logger.exception(
@@ -380,29 +333,22 @@ async def send_startup_messages(
 # ============================================================
 
 @bot.on_message(filters.command("start"))
-async def start_command(
-    _,
-    message: Message,
-):
-
-    text = (
-        "🎵 **Music Bot Online!**\n"
-        "\n"
-        "Use `/play song name` to play music.\n"
-        "\n"
-        "Commands:\n"
-        "• `/play <song>` - Play music\n"
-        "• `/queue` - Show queue\n"
-        "• `/now` - Current song\n"
-        "• `/skip` - Skip current song\n"
-        "• `/pause` - Pause playback\n"
-        "• `/resume` - Resume playback\n"
-        "• `/stop` - Stop music\n"
-        "• `/help` - Show help"
-    )
+async def start_command(_, message: Message):
 
     await message.reply_text(
-        text
+        "🎵 **Music Bot**\n"
+        "\n"
+        "YouTube Music voice chat player.\n"
+        "\n"
+        "Commands:\n"
+        "• `/play <song>`\n"
+        "• `/queue`\n"
+        "• `/now`\n"
+        "• `/skip`\n"
+        "• `/pause`\n"
+        "• `/resume`\n"
+        "• `/stop`\n"
+        "• `/help`"
     )
 
 
@@ -411,38 +357,18 @@ async def start_command(
 # ============================================================
 
 @bot.on_message(filters.command("help"))
-async def help_command(
-    _,
-    message: Message,
-):
-
-    text = (
-        "🎵 **Music Bot Commands**\n"
-        "\n"
-        "`/play <song>`\n"
-        "Search and play a song from YouTube Music.\n"
-        "\n"
-        "`/queue`\n"
-        "Show the current music queue.\n"
-        "\n"
-        "`/now`\n"
-        "Show currently playing song.\n"
-        "\n"
-        "`/skip`\n"
-        "Skip current song.\n"
-        "\n"
-        "`/pause`\n"
-        "Pause playback.\n"
-        "\n"
-        "`/resume`\n"
-        "Resume playback.\n"
-        "\n"
-        "`/stop`\n"
-        "Stop playback and clear queue."
-    )
+async def help_command(_, message: Message):
 
     await message.reply_text(
-        text
+        "🎵 **Music Commands**\n"
+        "\n"
+        "`/play song name` - Search and play\n"
+        "`/queue` - Show queue\n"
+        "`/now` - Current song\n"
+        "`/skip` - Skip current song\n"
+        "`/pause` - Pause playback\n"
+        "`/resume` - Resume playback\n"
+        "`/stop` - Stop playback\n"
     )
 
 
@@ -451,58 +377,30 @@ async def help_command(
 # ============================================================
 
 @bot.on_message(filters.command("play"))
-async def play_command(
-    _,
-    message: Message,
-):
-
-    # --------------------------------------------------------
-    # Check query
-    # --------------------------------------------------------
+async def play_command(_, message: Message):
 
     if len(message.command) < 2:
 
         await message.reply_text(
-            "❌ **Usage:**\n"
+            "❌ Usage:\n"
             "`/play song name`"
         )
 
         return
 
-    query = " ".join(
-        message.command[1:]
-    ).strip()
-
-    if not query:
-
-        await message.reply_text(
-            "❌ Please enter a song name."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Search status
-    # --------------------------------------------------------
+    query = " ".join(message.command[1:]).strip()
 
     status = await message.reply_text(
-        f"🔎 Searching YouTube Music for:\n"
-        f"`{query}`"
+        "🔎 Searching YouTube Music..."
     )
 
-    # --------------------------------------------------------
-    # Search
-    # --------------------------------------------------------
-
-    songs = await search_song(
-        query
-    )
+    songs = await search_song(query)
 
     if not songs:
 
         await safe_edit(
             status,
-            "❌ No results found.",
+            "❌ No songs found.",
         )
 
         return
@@ -511,75 +409,75 @@ async def play_command(
 
     chat_id = message.chat.id
 
+    if chat_id not in queues:
+        queues[chat_id] = []
+
     # --------------------------------------------------------
-    # Already playing
+    # CURRENT PLAYBACK
     # --------------------------------------------------------
 
     if chat_id in current_song:
 
-        queues.setdefault(
-            chat_id,
-            [],
-        ).append(song)
-
-        position = len(
-            queues[chat_id]
-        )
+        queues[chat_id].append(song)
 
         await safe_edit(
             status,
-            "🎵 **Added to Queue**\n"
-            "\n"
-            f"🎶 {song.title}\n"
-            f"👤 {song.artist}\n"
-            f"⏱ {song.duration}\n"
-            "\n"
-            f"📋 Position: {position}",
+            (
+                "➕ **Added to queue**\n"
+                "\n"
+                f"🎵 {song.title}\n"
+                f"👤 {song.artist}\n"
+                f"⏱ {song.duration}\n"
+                "\n"
+                f"📋 Position: {len(queues[chat_id])}"
+            ),
         )
 
         return
 
     # --------------------------------------------------------
-    # Prepare playback
+    # NOTHING PLAYING
     # --------------------------------------------------------
 
-    await safe_edit(
-        status,
-        "⏳ Preparing playback...\n"
-        "\n"
-        f"🎶 {song.title}\n"
-        f"👤 {song.artist}",
-    )
-
-    # --------------------------------------------------------
-    # Play
-    # --------------------------------------------------------
-
-    await play_song(
-        chat_id,
-        song,
-    )
-
-    # --------------------------------------------------------
-    # Result
-    # --------------------------------------------------------
-
-    if chat_id in current_song:
+    try:
 
         await safe_edit(
             status,
-            "▶️ **Now Playing**\n"
-            "\n"
-            f"🎶 {song.title}\n"
-            f"👤 {song.artist}\n"
-            f"⏱ {song.duration}",
+            (
+                "🎵 **Starting playback...**\n"
+                "\n"
+                f"🎵 {song.title}\n"
+                f"👤 {song.artist}\n"
+                f"⏱ {song.duration}"
+            ),
         )
 
-    else:
+        await play_song(
+            chat_id,
+            song,
+        )
 
         await safe_edit(
             status,
-            "❌ Failed to start playback.",
+            (
+                "▶️ **Now Playing**\n"
+                "\n"
+                f"🎵 {song.title}\n"
+                f"👤 {song.artist}\n"
+                f"⏱ {song.duration}"
+            ),
+        )
+
+    except Exception:
+
+        await safe_edit(
+            status,
+            (
+                "❌ **Playback failed.**\n"
+                "\n"
+                "YouTube rejected the stream request.\n"
+                "Check the Render logs for yt-dlp details."
+            ),
         )
 
 
@@ -588,21 +486,13 @@ async def play_command(
 # ============================================================
 
 @bot.on_message(filters.command("queue"))
-async def queue_command(
-    _,
-    message: Message,
-):
+async def queue_command(_, message: Message):
 
     chat_id = message.chat.id
 
-    current = current_song.get(
-        chat_id
-    )
+    queue = queues.get(chat_id, [])
 
-    queue = queues.get(
-        chat_id,
-        [],
-    )
+    current = current_song.get(chat_id)
 
     if not current and not queue:
 
@@ -614,29 +504,18 @@ async def queue_command(
 
     text = "🎵 **Music Queue**\n\n"
 
-    # --------------------------------------------------------
-    # Current song
-    # --------------------------------------------------------
-
     if current:
 
         text += (
-            "▶️ **Now Playing**\n"
-            f"🎶 {current.title}\n"
+            "▶️ **Playing:**\n"
+            f"🎵 {current.title}\n"
             f"👤 {current.artist}\n"
-            f"⏱ {current.duration}\n"
-            "\n"
+            f"⏱ {current.duration}\n\n"
         )
-
-    # --------------------------------------------------------
-    # Queue
-    # --------------------------------------------------------
 
     if queue:
 
-        text += (
-            "📋 **Up Next**\n\n"
-        )
+        text += "📋 **Up Next:**\n\n"
 
         for index, song in enumerate(
             queue,
@@ -649,9 +528,7 @@ async def queue_command(
                 f"   ⏱ {song.duration}\n\n"
             )
 
-    await message.reply_text(
-        text
-    )
+    await message.reply_text(text)
 
 
 # ============================================================
@@ -659,29 +536,24 @@ async def queue_command(
 # ============================================================
 
 @bot.on_message(filters.command("now"))
-async def now_command(
-    _,
-    message: Message,
-):
-
-    chat_id = message.chat.id
+async def now_command(_, message: Message):
 
     song = current_song.get(
-        chat_id
+        message.chat.id
     )
 
     if not song:
 
         await message.reply_text(
-            "❌ Nothing is playing right now."
+            "⏹ Nothing is playing."
         )
 
         return
 
     await message.reply_text(
-        "▶️ **Now Playing**\n"
+        "🎵 **Now Playing**\n"
         "\n"
-        f"🎶 {song.title}\n"
+        f"🎵 {song.title}\n"
         f"👤 {song.artist}\n"
         f"⏱ {song.duration}"
     )
@@ -692,17 +564,14 @@ async def now_command(
 # ============================================================
 
 @bot.on_message(filters.command("skip"))
-async def skip_command(
-    _,
-    message: Message,
-):
+async def skip_command(_, message: Message):
 
     chat_id = message.chat.id
 
     if chat_id not in current_song:
 
         await message.reply_text(
-            "❌ Nothing is playing."
+            "⏹ Nothing is playing."
         )
 
         return
@@ -713,12 +582,8 @@ async def skip_command(
             chat_id
         )
 
-    except Exception as error:
-
-        logger.warning(
-            "leave_call during skip failed: %s",
-            error,
-        )
+    except Exception:
+        pass
 
     current_song.pop(
         chat_id,
@@ -726,7 +591,7 @@ async def skip_command(
     )
 
     await message.reply_text(
-        "⏭️ Skipped."
+        "⏭ **Skipped.**"
     )
 
     await asyncio.sleep(1)
@@ -737,29 +602,20 @@ async def skip_command(
             chat_id
         )
 
-    else:
-
-        await message.reply_text(
-            "📭 Queue is empty."
-        )
-
 
 # ============================================================
 # /PAUSE
 # ============================================================
 
 @bot.on_message(filters.command("pause"))
-async def pause_command(
-    _,
-    message: Message,
-):
+async def pause_command(_, message: Message):
 
     chat_id = message.chat.id
 
     if chat_id not in current_song:
 
         await message.reply_text(
-            "❌ Nothing is playing."
+            "⏹ Nothing is playing."
         )
 
         return
@@ -771,7 +627,7 @@ async def pause_command(
         )
 
         await message.reply_text(
-            "⏸️ Playback paused."
+            "⏸ Playback paused."
         )
 
     except Exception as error:
@@ -782,7 +638,7 @@ async def pause_command(
         )
 
         await message.reply_text(
-            "❌ Failed to pause playback."
+            f"❌ Pause failed:\n`{error}`"
         )
 
 
@@ -791,17 +647,14 @@ async def pause_command(
 # ============================================================
 
 @bot.on_message(filters.command("resume"))
-async def resume_command(
-    _,
-    message: Message,
-):
+async def resume_command(_, message: Message):
 
     chat_id = message.chat.id
 
     if chat_id not in current_song:
 
         await message.reply_text(
-            "❌ Nothing is playing."
+            "⏹ Nothing is playing."
         )
 
         return
@@ -824,7 +677,7 @@ async def resume_command(
         )
 
         await message.reply_text(
-            "❌ Failed to resume playback."
+            f"❌ Resume failed:\n`{error}`"
         )
 
 
@@ -833,10 +686,7 @@ async def resume_command(
 # ============================================================
 
 @bot.on_message(filters.command("stop"))
-async def stop_command(
-    _,
-    message: Message,
-):
+async def stop_command(_, message: Message):
 
     chat_id = message.chat.id
 
@@ -846,12 +696,8 @@ async def stop_command(
             chat_id
         )
 
-    except Exception as error:
-
-        logger.warning(
-            "leave_call during stop failed: %s",
-            error,
-        )
+    except Exception:
+        pass
 
     queues.pop(
         chat_id,
@@ -864,18 +710,16 @@ async def stop_command(
     )
 
     await message.reply_text(
-        "⏹️ Music stopped.\n"
-        "🗑️ Queue cleared."
+        "⏹ **Playback stopped.**\n"
+        "🗑 Queue cleared."
     )
 
 
 # ============================================================
-# STREAM END HANDLER
+# STREAM END
 # ============================================================
 
-@voice.on_update(
-    tg_filters.stream_end()
-)
+@voice.on_update(tg_filters.stream_end())
 async def stream_ended_handler(
     _,
     update: StreamEnded,
@@ -884,7 +728,7 @@ async def stream_ended_handler(
     chat_id = update.chat_id
 
     logger.info(
-        "Stream ended in chat %s",
+        "Stream ended in %s",
         chat_id,
     )
 
@@ -897,20 +741,8 @@ async def stream_ended_handler(
 
     if queues.get(chat_id):
 
-        logger.info(
-            "Playing next queued song in %s",
-            chat_id,
-        )
-
         await play_next(
             chat_id
-        )
-
-    else:
-
-        logger.info(
-            "No more songs in queue for %s",
-            chat_id,
         )
 
 
@@ -921,19 +753,11 @@ async def stream_ended_handler(
 async def main():
 
     logger.info(
-        "======================================"
-    )
-
-    logger.info(
         "Starting Music Bot..."
     )
 
-    logger.info(
-        "======================================"
-    )
-
     # --------------------------------------------------------
-    # START BOT
+    # BOT
     # --------------------------------------------------------
 
     await bot.start()
@@ -942,12 +766,12 @@ async def main():
 
     logger.info(
         "Bot started: @%s | ID: %s",
-        bot_user.username or "N/A",
+        bot_user.username,
         bot_user.id,
     )
 
     # --------------------------------------------------------
-    # START ASSISTANT
+    # ASSISTANT
     # --------------------------------------------------------
 
     await assistant.start()
@@ -956,12 +780,12 @@ async def main():
 
     logger.info(
         "Assistant started: @%s | ID: %s",
-        assistant_user.username or "N/A",
+        assistant_user.username,
         assistant_user.id,
     )
 
     # --------------------------------------------------------
-    # START PYTGCalls
+    # PYTG CALLS
     # --------------------------------------------------------
 
     await voice.start()
@@ -971,7 +795,7 @@ async def main():
     )
 
     # --------------------------------------------------------
-    # SEND TWO STARTUP MESSAGES
+    # STARTUP MESSAGES
     # --------------------------------------------------------
 
     await send_startup_messages(
@@ -979,20 +803,8 @@ async def main():
         assistant_user,
     )
 
-    # --------------------------------------------------------
-    # READY
-    # --------------------------------------------------------
-
-    logger.info(
-        "======================================"
-    )
-
     logger.info(
         "MUSIC BOT IS READY"
-    )
-
-    logger.info(
-        "======================================"
     )
 
     # --------------------------------------------------------
@@ -1017,5 +829,12 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         logger.info(
-            "Music Bot stopped."
+            "Bot stopped by user."
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Fatal error: %s",
+            error,
         )
