@@ -1,6 +1,6 @@
 pyrogram==2.0.106
-tgcrypto
-pytgcalls
+tgcrypto==1.2.5
+py-tgcalls==3.0.0
 ytmusicapi
 yt-dlp
 python-dotenv
