@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
-from pyrogram.types import InlineKeyboardMarimport os
+from pyrogram.types import InlineKeyboardMarimport
 import re
 import json
 import asyncio
