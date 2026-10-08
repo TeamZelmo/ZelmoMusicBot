@@ -9,14 +9,14 @@ from pyrogram.types import Message
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 
+from ytmusicapi import YTMusic
+
 from config import (
     API_ID,
     API_HASH,
     BOT_TOKEN,
     ASSISTANT_SESSION,
 )
-
-from ytmusicapi import YTMusic
 
 
 # ============================================================
@@ -25,14 +25,14 @@ from ytmusicapi import YTMusic
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("MusicBot")
+logger = logging.getLogger("TelegramMusicBot")
 
 
 # ============================================================
-# TELEGRAM CLIENTS
+# CLIENTS
 # ============================================================
 
 bot = Client(
@@ -52,7 +52,7 @@ assistant = Client(
 
 
 # ============================================================
-# PYTGCalls
+# VOICE CALL
 # ============================================================
 
 voice = PyTgCalls(assistant)
@@ -71,6 +71,7 @@ ytmusic = YTMusic()
 
 @dataclass
 class Song:
+
     title: str
     artist: str
     video_id: str
@@ -78,7 +79,11 @@ class Song:
 
     @property
     def url(self) -> str:
-        return f"https://www.youtube.com/watch?v={self.video_id}"
+
+        return (
+            "https://www.youtube.com/watch?v="
+            + self.video_id
+        )
 
 
 queues: Dict[int, List[Song]] = {}
@@ -87,12 +92,15 @@ current_song: Dict[int, Song] = {}
 
 
 # ============================================================
-# SEARCH YOUTUBE MUSIC
+# SEARCH
 # ============================================================
 
-async def search_song(query: str) -> Optional[Song]:
+async def search_song(
+    query: str,
+) -> Optional[Song]:
 
     try:
+
         results = await asyncio.to_thread(
             ytmusic.search,
             query,
@@ -101,10 +109,12 @@ async def search_song(query: str) -> Optional[Song]:
         )
 
     except Exception as error:
+
         logger.exception(
-            "YouTube Music search error: %s",
+            "YouTube Music search failed: %s",
             error,
         )
+
         return None
 
     if not results:
@@ -112,7 +122,9 @@ async def search_song(query: str) -> Optional[Song]:
 
     for result in results:
 
-        video_id = result.get("videoId")
+        video_id = result.get(
+            "videoId"
+        )
 
         if not video_id:
             continue
@@ -130,14 +142,15 @@ async def search_song(query: str) -> Optional[Song]:
         if artists:
 
             artist = ", ".join(
-                item.get(
+                artist.get(
                     "name",
                     "Unknown",
                 )
-                for item in artists
+                for artist in artists
             )
 
         else:
+
             artist = "Unknown"
 
         duration = 0
@@ -175,6 +188,7 @@ async def search_song(query: str) -> Optional[Song]:
                     )
 
             except Exception:
+
                 duration = 0
 
         return Song(
@@ -191,7 +205,7 @@ async def search_song(query: str) -> Optional[Song]:
 # FORMAT SONG
 # ============================================================
 
-def format_song(song: Song) -> str:
+def song_text(song: Song) -> str:
 
     return (
         f"🎵 **{song.title}**\n"
@@ -200,21 +214,20 @@ def format_song(song: Song) -> str:
 
 
 # ============================================================
-# CREATE STREAM
+# CREATE MEDIA STREAM
 # ============================================================
 
-def create_stream(song: Song):
+def create_stream(
+    song: Song,
+) -> MediaStream:
 
     return MediaStream(
         song.url,
-        audio_parameters={
-            "format": "best",
-        },
     )
 
 
 # ============================================================
-# PLAY SONG
+# PLAY
 # ============================================================
 
 async def play_song(
@@ -222,7 +235,9 @@ async def play_song(
     song: Song,
 ):
 
-    stream = create_stream(song)
+    stream = create_stream(
+        song
+    )
 
     await voice.play(
         chat_id,
@@ -280,9 +295,8 @@ async def start_command(
 
     await message.reply_text(
         "🎵 **Telegram Music Bot**\n\n"
-        "I can play YouTube Music audio "
-        "inside Telegram Voice Chat.\n\n"
-        "Use `/help` to see all commands."
+        "I can play music in Telegram Voice Chat.\n\n"
+        "Use `/help` for commands."
     )
 
 
@@ -299,28 +313,28 @@ async def help_command(
 ):
 
     await message.reply_text(
-        "🎵 **Music Bot Commands**\n\n"
+        "🎵 **Music Commands**\n\n"
 
         "▶️ `/play <song>`\n"
         "Play a song\n\n"
 
         "📋 `/queue`\n"
-        "Show music queue\n\n"
+        "Show queue\n\n"
 
         "🎵 `/now`\n"
         "Show current song\n\n"
 
         "⏭ `/skip`\n"
-        "Skip current song\n\n"
+        "Skip song\n\n"
 
         "⏸ `/pause`\n"
-        "Pause playback\n\n"
+        "Pause\n\n"
 
         "▶️ `/resume`\n"
-        "Resume playback\n\n"
+        "Resume\n\n"
 
         "⏹ `/stop`\n"
-        "Stop playback and clear queue\n\n"
+        "Stop and clear queue\n\n"
 
         "❓ `/help`\n"
         "Show commands"
@@ -328,7 +342,7 @@ async def help_command(
 
 
 # ============================================================
-# PLAY
+# PLAY COMMAND
 # ============================================================
 
 @bot.on_message(
@@ -342,7 +356,7 @@ async def play_command(
     if len(message.command) < 2:
 
         await message.reply_text(
-            "❌ Please provide a song name.\n\n"
+            "❌ Please enter a song name.\n\n"
             "Example:\n"
             "`/play Believer Imagine Dragons`"
         )
@@ -354,7 +368,7 @@ async def play_command(
     )
 
     status = await message.reply_text(
-        f"🔎 Searching:\n"
+        f"🔎 Searching for:\n"
         f"**{query}**"
     )
 
@@ -372,7 +386,10 @@ async def play_command(
 
     chat_id = message.chat.id
 
-    # Existing playback
+    # --------------------------------------------------------
+    # Add to queue if something is already playing
+    # --------------------------------------------------------
+
     if chat_id in current_song:
 
         queues.setdefault(
@@ -386,11 +403,15 @@ async def play_command(
 
         await status.edit_text(
             "➕ **Added to Queue**\n\n"
-            f"{format_song(song)}\n\n"
+            f"{song_text(song)}\n\n"
             f"📍 Position: `{position}`"
         )
 
         return
+
+    # --------------------------------------------------------
+    # Start playback
+    # --------------------------------------------------------
 
     try:
 
@@ -401,23 +422,22 @@ async def play_command(
 
         await status.edit_text(
             "▶️ **Now Playing**\n\n"
-            f"{format_song(song)}"
+            f"{song_text(song)}"
         )
 
     except Exception as error:
 
         logger.exception(
-            "Playback error: %s",
+            "Playback failed: %s",
             error,
         )
 
         await status.edit_text(
             "❌ **Playback failed.**\n\n"
-            "Make sure:\n"
-            "• Assistant is in the group\n"
-            "• Assistant can join the Voice Chat\n"
-            "• Voice Chat is active\n"
-            "• FFmpeg is installed"
+            "Make sure the Assistant account:\n"
+            "• is inside this group\n"
+            "• can join the Voice Chat\n"
+            "• has permission to speak"
         )
 
 
@@ -466,7 +486,7 @@ async def queue_command(
 
 
 # ============================================================
-# NOW PLAYING
+# NOW
 # ============================================================
 
 @bot.on_message(
@@ -493,7 +513,7 @@ async def now_command(
 
     await message.reply_text(
         "🎵 **Now Playing**\n\n"
-        f"{format_song(song)}"
+        f"{song_text(song)}"
     )
 
 
@@ -543,25 +563,25 @@ async def skip_command(
             await message.reply_text(
                 "⏭ **Skipped**\n\n"
                 "▶️ **Now Playing**\n"
-                f"{format_song(song)}"
+                f"{song_text(song)}"
             )
 
         else:
 
             await message.reply_text(
-                "⏭ Song skipped.\n"
+                "⏭ Skipped.\n"
                 "📭 Queue is empty."
             )
 
     except Exception as error:
 
         logger.exception(
-            "Skip error: %s",
+            "Skip failed: %s",
             error,
         )
 
         await message.reply_text(
-            "❌ Could not skip."
+            "❌ Could not skip the song."
         )
 
 
@@ -586,18 +606,18 @@ async def pause_command(
         )
 
         await message.reply_text(
-            "⏸ **Playback paused.**"
+            "⏸ **Paused.**"
         )
 
     except Exception as error:
 
         logger.exception(
-            "Pause error: %s",
+            "Pause failed: %s",
             error,
         )
 
         await message.reply_text(
-            "❌ Playback could not be paused."
+            "❌ Could not pause playback."
         )
 
 
@@ -622,18 +642,18 @@ async def resume_command(
         )
 
         await message.reply_text(
-            "▶️ **Playback resumed.**"
+            "▶️ **Resumed.**"
         )
 
     except Exception as error:
 
         logger.exception(
-            "Resume error: %s",
+            "Resume failed: %s",
             error,
         )
 
         await message.reply_text(
-            "❌ Playback could not be resumed."
+            "❌ Could not resume playback."
         )
 
 
@@ -675,7 +695,7 @@ async def stop_command(
     )
 
     await message.reply_text(
-        "⏹ **Playback stopped.**\n"
+        "⏹ **Stopped.**\n"
         "🗑 Queue cleared."
     )
 
@@ -688,7 +708,7 @@ async def main():
 
     print()
     print("========================================")
-    print("          TELEGRAM MUSIC BOT")
+    print("        TELEGRAM MUSIC BOT")
     print("========================================")
 
     await bot.start()
@@ -701,19 +721,20 @@ async def main():
 
     await voice.start()
 
-    print("✓ Voice client started")
+    print("✓ Voice system started")
 
     bot_user = await bot.get_me()
+
     assistant_user = await assistant.get_me()
 
     print()
     print(
-        f"Bot       : "
+        "Bot       : "
         f"@{bot_user.username or bot_user.first_name}"
     )
 
     print(
-        f"Assistant : "
+        "Assistant : "
         f"@{assistant_user.username or assistant_user.first_name}"
     )
 
@@ -740,5 +761,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         print(
-            "\nBot stopped."
+            "Bot stopped."
         )
